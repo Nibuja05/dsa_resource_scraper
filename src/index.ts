@@ -50,7 +50,7 @@ async function searchWeb(phrase: string, ruleSystem: string) {
 	let index = 1;
 
 	for (const link of uniqueLinks) {
-		process.stdout.write(`-> Quelle ${index} von ${uniqueLinks.size}\r`);
+		process.stdout.write(`-> Ergebnis ${index} von ${uniqueLinks.size}\r`);
 		index++;
 
 		const rawSources = await findRawSources(getFullUrl(link));
