@@ -163,7 +163,7 @@ async function checkAndUpdateSourceRules(
 
 	if (data[source.name]) return data[source.name];
 
-	const result = await getSourceRuling(source.link); // Replace with your actual check
+	const result = await getSourceRuling(source.link);
 	data[source.name] = result;
 	await fs.writeJson(filePath, data, { spaces: 2 }).catch(console.error);
 

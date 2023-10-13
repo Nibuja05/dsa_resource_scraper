@@ -22,3 +22,8 @@ interface Sources {
 }
 
 type SourcesKey = keyof Sources;
+
+interface AnalyzeAnswer {
+	pages: DocumentPage[] | undefined;
+	tables: DocumentTable[] | undefined;
+}
