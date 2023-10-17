@@ -1,9 +1,8 @@
 import {
-	AnalyzeResult,
-	AnalyzedDocument,
 	AzureKeyCredential,
 	DocumentAnalysisClient,
 	DocumentParagraph,
+	DocumentTable,
 } from "@azure/ai-form-recognizer";
 import * as dotenv from "dotenv";
 dotenv.config();
@@ -11,8 +10,8 @@ dotenv.config();
 import fs from "fs-extra";
 import { PDFDocument } from "pdf-lib";
 
-const FILE_PATH = "./res/pdfs/Grüne Reihe/G07 - Aus Licht und Traum.pdf";
-const PAGE_NUMBER = 105;
+const FILE_NAME = "Liber Cantiones";
+const PAGE_NUMBER = 102;
 
 async function extractPage(
 	filePath: string,
@@ -26,141 +25,140 @@ async function extractPage(
 	return await newPdfDoc.save();
 }
 
-async function getPageContent() {
-	const filePath = "./res/temp.json";
+async function getPageContent(name: string, page: number) {
+	const filePath = "./res/downloaded.json";
+	let saved: SavedQuery = {};
 	if (fs.existsSync(filePath)) {
-		console.log("Use saved data!\n");
-		const fileContent = fs.readFileSync(filePath, "utf-8");
-		return JSON.parse(fileContent) as AnalyzeResult<AnalyzedDocument>;
+		saved = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SavedQuery;
+		if (name in saved && page in saved[name]) {
+			return saved[name][page];
+		}
 	} else {
-		const client = new DocumentAnalysisClient(
-			process.env.AZURE_ENDPOINT!,
-			new AzureKeyCredential(process.env.AZURE_KEY!)
-		);
-		const input = await extractPage(FILE_PATH, PAGE_NUMBER);
-
-		const poller = await client.beginAnalyzeDocument(
-			"prebuilt-layout",
-			input
-		);
-		const data = await poller.pollUntilDone();
-
-		fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-		return data;
+		fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
 	}
+
+	const client = new DocumentAnalysisClient(
+		process.env.AZURE_ENDPOINT!,
+		new AzureKeyCredential(process.env.AZURE_KEY!)
+	);
+	const input = await extractPage(`./res/${name}.pdf`, page);
+
+	const poller = await client.beginAnalyzeDocument("prebuilt-layout", input);
+	const data = await poller.pollUntilDone();
+
+	if (!(name in saved)) {
+		saved[name] = {};
+	}
+	saved[name][page] = data;
+	fs.writeFileSync(filePath, JSON.stringify(saved, null, 2));
+	return data;
 }
 
 async function main() {
-	const content = await getPageContent();
+	const name = FILE_NAME;
+	const pageNumber = PAGE_NUMBER;
+	const content = await getPageContent(name, pageNumber);
 
 	if (content.paragraphs) {
-		const sortedParagraphs = sortDocumentParagraphs(content.paragraphs);
+		let paragraphs = content.paragraphs;
+		if (content.tables) {
+			paragraphs = filterOutTables(paragraphs, content.tables);
+		}
+		const page = parsePage(paragraphs, pageNumber);
 
 		let text = "";
-		let page = 0;
-		for (const paragraph of sortedParagraphs) {
-			if (paragraph.role && paragraph.role == "pageNumber") {
-				page = parseInt(paragraph.content);
-				continue;
+
+		const cleanTitle = (title: string) =>
+			title.replaceAll("İ", "I").replaceAll("V", "U");
+		const cleanText = (text: string) =>
+			text.replaceAll(/(?<=\w)- (?=\w)/g, "");
+
+		for (const section of page.sections) {
+			if (section.isTitle) {
+				text += `\n\n# ${cleanTitle(section.name)}\n\n`;
+			} else {
+				text += `\n## ${cleanTitle(section.name)}\n\n`;
 			}
-			if (paragraph.role && paragraph.role == "sectionHeading")
-				text += "\n";
-			text += `${paragraph.content}\n`;
+			for (const paragraph of section.paragraphs) {
+				text += `${paragraph.content}\n`;
+			}
+			text = cleanText(text);
 		}
 
-		text = text.replaceAll(/(?<=\w)- (?=\w)/g, "");
 		text = `Seite ${page}:\n\n${text}`;
 		console.log(text);
 	}
-
-	// if (!content.pages || content.pages.length <= 0) {
-	// 	console.log("No pages were extracted from the document.");
-	// } else {
-	// 	console.log("Pages:");
-	// 	for (const page of content.pages) {
-	// 		console.log("- Page", page.pageNumber, `(unit: ${page.unit})`);
-	// 		console.log(`  ${page.width}x${page.height}, angle: ${page.angle}`);
-	// 		console.log(
-	// 			`  ${page.lines?.length} lines, ${page.words?.length} words`
-	// 		);
-
-	// 		console.log("\n");
-	// 		let text = "";
-	// 		for (const line of page.lines ?? []) {
-	// 			text += line.content + "\n";
-	// 		}
-	// 		console.log(text);
-	// 	}
-	// }
-
-	// if (!content.tables || content.tables.length <= 0) {
-	// 	console.log("No tables were extracted from the document.");
-	// } else {
-	// 	console.log("Tables:");
-	// 	for (const table of content.tables) {
-	// 		console.log(
-	// 			`- Extracted table: ${table.columnCount} columns, ${table.rowCount} rows (${table.cells.length} cells)`
-	// 		);
-	// 	}
-	// }
 }
 
-function sortDocumentParagraphs(
-	paragraphs: DocumentParagraph[]
-): DocumentParagraph[] {
-	const filteredParagraphs = paragraphs.filter(
+function filterOutTables(
+	paragraphs: DocumentParagraph[],
+	tables: DocumentTable[]
+) {
+	let newParagraphs: DocumentParagraph[] = [];
+
+	for (const paragraph of paragraphs) {
+		const pXMin = paragraph.boundingRegions![0].polygon![0].x;
+		const pXMax = paragraph.boundingRegions![0].polygon![2].x;
+		const pYMin = paragraph.boundingRegions![0].polygon![0].y;
+		const pYMax = paragraph.boundingRegions![0].polygon![2].y;
+
+		let shouldAdd = true;
+
+		for (const table of tables) {
+			for (const cell of table.cells) {
+				const cXMin = cell.boundingRegions![0].polygon![0].x;
+				const cXMax = cell.boundingRegions![0].polygon![2].x;
+				const cYMin = cell.boundingRegions![0].polygon![0].y;
+				const cYMax = cell.boundingRegions![0].polygon![2].y;
+
+				if (
+					pXMin == cXMin &&
+					pXMax == cXMax &&
+					pYMin == cYMin &&
+					pYMax == cYMax
+				) {
+					console.log("Same!");
+					shouldAdd = false;
+				}
+			}
+		}
+
+		if (shouldAdd) newParagraphs.push(paragraph);
+	}
+
+	return newParagraphs;
+}
+
+function parsePage(
+	paragraphs: DocumentParagraph[],
+	page: number,
+	lastTitle?: string
+): ParsedPage {
+	let filteredParagraphs = paragraphs.filter(
 		(p) => p.boundingRegions && p.boundingRegions[0].polygon
 	);
 
-	// Correct major header detection
-	const majorHeaders: DocumentParagraph[] = [];
-	filteredParagraphs.forEach((p) => {
-		if (p.role === "sectionHeading") {
-			const yMin = p.boundingRegions![0].polygon![0].y;
-			const yMax = p.boundingRegions![0].polygon![2].y;
+	function sortIntoColums(paragraphs: CustomDocumentParagraph[]) {
+		let sortedParagraphs: CustomDocumentParagraph[] = [];
 
-			const overlapping = filteredParagraphs.some((otherP) => {
-				if (otherP === p || otherP.role === "sectionHeading")
-					return false;
-				const otherYMin = otherP.boundingRegions![0].polygon![0].y;
-				const otherYMax = otherP.boundingRegions![0].polygon![2].y;
-				return otherYMin <= yMax && otherYMax >= yMin;
-			});
-
-			if (!overlapping) {
-				majorHeaders.push(p);
-			}
-		}
-	});
-
-	majorHeaders.sort(
-		(a, b) =>
-			a.boundingRegions![0].polygon![0].y -
-			b.boundingRegions![0].polygon![0].y
-	);
-
-	let sortedParagraphs: DocumentParagraph[] = [];
-	let lastYMax = 0;
-
-	for (const majorHeader of majorHeaders) {
-		const yMin = majorHeader.boundingRegions![0].polygon![0].y;
-		const section = filteredParagraphs.filter((p) => {
-			const pYMin = p.boundingRegions![0].polygon![0].y;
-			return pYMin >= lastYMax && pYMin < yMin;
-		});
+		// Identify columns based on significant jumps in x-coordinate
+		let currentColumn: CustomDocumentParagraph[] = [];
+		let columnIndex = 1;
+		let lastXMax = 0;
 
 		// Sort by x-coordinate
-		section.sort(
+		paragraphs.sort(
 			(a, b) =>
 				a.boundingRegions![0].polygon![0].x -
 				b.boundingRegions![0].polygon![0].x
 		);
 
-		// Identify columns based on significant jumps in x-coordinate
-		let currentColumn: DocumentParagraph[] = [];
-		let lastXMax = 0;
-
-		for (const paragraph of section) {
+		for (const paragraph of paragraphs) {
+			if (paragraph.role === "title") {
+				paragraph.column = columnIndex;
+				currentColumn.push(paragraph);
+				continue;
+			}
 			const xMin = paragraph.boundingRegions![0].polygon![0].x;
 			if (xMin > lastXMax) {
 				currentColumn.sort(
@@ -169,9 +167,11 @@ function sortDocumentParagraphs(
 						b.boundingRegions![0].polygon![0].y
 				);
 				sortedParagraphs = [...sortedParagraphs, ...currentColumn];
+				paragraph.column = columnIndex;
 				currentColumn = [paragraph];
 				lastXMax = paragraph.boundingRegions![0].polygon![1].x;
 			} else {
+				paragraph.column = columnIndex;
 				currentColumn.push(paragraph);
 			}
 		}
@@ -181,17 +181,215 @@ function sortDocumentParagraphs(
 				a.boundingRegions![0].polygon![0].y -
 				b.boundingRegions![0].polygon![0].y
 		);
-		sortedParagraphs = [...sortedParagraphs, ...currentColumn, majorHeader];
-		lastYMax = majorHeader.boundingRegions![0].polygon![2].y;
+		sortedParagraphs = [...sortedParagraphs, ...currentColumn];
+		return sortedParagraphs;
 	}
 
-	// Include paragraphs after the last major header
-	const lastSection = filteredParagraphs.filter(
-		(p) => p.boundingRegions![0].polygon![0].y >= lastYMax
-	);
-	sortedParagraphs = [...sortedParagraphs, ...lastSection];
+	function splitAndSort(filteredParagraphs: DocumentParagraph[]): ParsedPage {
+		let title: string | undefined;
+		let lastTitleCandidate: string | undefined;
+		let actualPage: number | undefined;
 
-	return sortedParagraphs;
+		// Correct major header detection
+		const majorHeaders: DocumentParagraph[] = [];
+		filteredParagraphs = filteredParagraphs.filter((p) => {
+			if (p.role === "pageNumber") {
+				actualPage = parseInt(p.content);
+				return false;
+			}
+			if (p.role === "title") {
+				if (lastTitleCandidate && lastTitleCandidate === p.content) {
+					title = lastTitleCandidate;
+				} else {
+					lastTitleCandidate = p.content;
+				}
+
+				const yMin = p.boundingRegions![0].polygon![0].y;
+				if (yMin >= 0.5) {
+					majorHeaders.push(p);
+				} else return false;
+			}
+			if (p.role === "sectionHeading") {
+				const yMin = p.boundingRegions![0].polygon![0].y;
+				const yMax = p.boundingRegions![0].polygon![2].y;
+
+				const overlapping = filteredParagraphs.some((otherP) => {
+					if (otherP === p || otherP.role === "sectionHeading")
+						return false;
+					const otherYMin = otherP.boundingRegions![0].polygon![0].y;
+					const otherYMax = otherP.boundingRegions![0].polygon![2].y;
+					return otherYMin <= yMax && otherYMax >= yMin;
+				});
+
+				if (!overlapping) {
+					majorHeaders.push(p);
+				}
+			}
+			return true;
+		});
+
+		majorHeaders.sort(
+			(a, b) =>
+				a.boundingRegions![0].polygon![0].y -
+				b.boundingRegions![0].polygon![0].y
+		);
+
+		let sections: DocumentSection[] = [];
+		let lastYMax = 0;
+		let lastHeader: DocumentParagraph | undefined;
+
+		for (const majorHeader of majorHeaders) {
+			const yMin = majorHeader.boundingRegions![0].polygon![0].y;
+			let bounds: [number, number] = [999, 0];
+			const section = filteredParagraphs.filter((p) => {
+				const pYMin = p.boundingRegions![0].polygon![0].y;
+				const pYMax = p.boundingRegions![0].polygon![2].y;
+				if (pYMin >= lastYMax && pYMin < yMin) {
+					if (pYMin < bounds[0]) bounds[0] = pYMin;
+					if (pYMax > bounds[1]) bounds[1] = pYMax;
+					return true;
+				}
+			});
+
+			const paragraphs = sortIntoColums(section);
+			if (paragraphs.length > 0) {
+				let curSection: DocumentSection = {
+					name: lastTitle ?? "",
+					paragraphs: paragraphs,
+					bounds,
+				};
+				if (lastHeader && lastHeader.role === "title") {
+					curSection.isTitle = true;
+				}
+				sections.push(curSection);
+			}
+
+			// sortedParagraphs = [...sortedParagraphs, ...currentColumn, majorHeader];
+			lastTitle = majorHeader.content;
+			lastHeader = majorHeader;
+			lastYMax = majorHeader.boundingRegions![0].polygon![2].y;
+		}
+
+		// Include paragraphs after the last major header
+		let bounds: [number, number] = [999, 0];
+		const lastSection = filteredParagraphs.filter((p) => {
+			const pYMin = p.boundingRegions![0].polygon![0].y;
+			const pYMax = p.boundingRegions![0].polygon![2].y;
+			if (pYMin >= lastYMax) {
+				if (pYMin < bounds[0]) bounds[0] = pYMin;
+				if (pYMax > bounds[1]) bounds[1] = pYMax;
+				return true;
+			}
+		});
+		let curSection: DocumentSection = {
+			name: lastTitle ?? "",
+			paragraphs: sortIntoColums(lastSection),
+			bounds,
+		};
+		if (lastHeader && lastHeader.role === "title") {
+			curSection.isTitle = true;
+		}
+		if (curSection.paragraphs.length > 0) sections.push(curSection);
+
+		return {
+			pdfPage: page,
+			page: actualPage ?? page,
+			title,
+			sections,
+		};
+	}
+
+	function sortAndParse(filteredParagraphs: DocumentParagraph[]): ParsedPage {
+		let title: string | undefined;
+		let lastTitleCandidate: string | undefined;
+		let actualPage: number | undefined;
+
+		let sortedParagraphs = sortIntoColums(filteredParagraphs);
+
+		// Correct major header detection
+		const majorHeaders: DocumentParagraph[] = [];
+		sortedParagraphs = sortedParagraphs.filter((p) => {
+			if (p.role === "pageNumber") {
+				actualPage = parseInt(p.content);
+				return false;
+			}
+			if (p.role === "title") {
+				if (lastTitleCandidate && lastTitleCandidate === p.content) {
+					title = lastTitleCandidate;
+				} else {
+					lastTitleCandidate = p.content;
+				}
+
+				const yMin = p.boundingRegions![0].polygon![0].y;
+				if (yMin >= 0.5) {
+					majorHeaders.push(p);
+				} else return false;
+			}
+			if (p.role === "sectionHeading") {
+				majorHeaders.push(p);
+			}
+			return true;
+		});
+
+		let sections: DocumentSection[] = [];
+		let lastHeader: DocumentParagraph | undefined;
+
+		let sectionedParagraphs: Array<
+			[DocumentParagraph | undefined, DocumentParagraph[]]
+		> = [];
+		let tempSection: DocumentParagraph[] = [];
+		for (const paragraph of sortedParagraphs) {
+			if (majorHeaders.includes(paragraph)) {
+				sectionedParagraphs.push([paragraph, tempSection]);
+				tempSection = [];
+			} else {
+				tempSection.push(paragraph);
+			}
+		}
+		sectionedParagraphs.push([undefined, tempSection]);
+
+		for (const [majorHeader, paragraphs] of sectionedParagraphs) {
+			let bounds: [number, number] = [999, 0];
+			sortedParagraphs.forEach((p) => {
+				const pYMin = p.boundingRegions![0].polygon![0].y;
+				const pYMax = p.boundingRegions![0].polygon![2].y;
+
+				if (pYMin < bounds[0]) bounds[0] = pYMin;
+				if (pYMax > bounds[1]) bounds[1] = pYMax;
+			});
+
+			if (paragraphs.length > 1) {
+				let curSection: DocumentSection = {
+					name: lastTitle ?? "",
+					paragraphs: paragraphs,
+					bounds,
+				};
+				if (lastHeader && lastHeader.role === "title") {
+					curSection.isTitle = true;
+				}
+				sections.push(curSection);
+			}
+
+			if (majorHeader) {
+				lastTitle = majorHeader.content;
+				lastHeader = majorHeader;
+			}
+		}
+
+		return {
+			pdfPage: page,
+			page: actualPage ?? page,
+			title,
+			sections,
+		};
+	}
+
+	let parsedPage = splitAndSort(filteredParagraphs);
+	if (parsedPage.sections.length < 2) {
+		parsedPage = sortAndParse(filteredParagraphs);
+	}
+
+	return parsedPage;
 }
 
 main().catch((error) => {

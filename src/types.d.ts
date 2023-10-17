@@ -27,3 +27,32 @@ interface AnalyzeAnswer {
 	pages: DocumentPage[] | undefined;
 	tables: DocumentTable[] | undefined;
 }
+
+interface ParsedPage {
+	pdfPage: number;
+	page: number;
+	title?: string;
+	sections: DocumentSection[];
+}
+
+type CustomDocumentParagraph =
+	import("@azure/ai-form-recognizer").DocumentParagraph & {
+		column?: number;
+	};
+
+interface DocumentSection {
+	name: string;
+	isTitle?: boolean;
+	paragraphs: CustomDocumentParagraph[];
+	bounds: [number, number];
+}
+
+type PDFAnalyzeResults = import("@azure/ai-form-recognizer").AnalyzeResult<
+	import("@azure/ai-form-recognizer").AnalyzedDocument
+>;
+
+interface SavedQuery {
+	[name: string]: {
+		[page: string]: PDFAnalyzeResults;
+	};
+}
