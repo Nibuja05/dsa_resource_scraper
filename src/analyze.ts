@@ -8,10 +8,11 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 import fs from "fs-extra";
+import * as path from "path";
 import { PDFDocument } from "pdf-lib";
 
 const FILE_NAME = "Liber Cantiones";
-const PAGE_NUMBER = 102;
+const PAGE_NUMBER = 103;
 
 async function extractPage(
 	filePath: string,
@@ -54,10 +55,29 @@ async function getPageContent(name: string, page: number) {
 	return data;
 }
 
-async function main() {
-	const name = FILE_NAME;
-	const pageNumber = PAGE_NUMBER;
+function saveResult(name: string, page: number, text: string) {
+	const filePath = `./results/${name}`;
+	fs.ensureDirSync(path.dirname(`${filePath}.json`));
+	let data: SavedFile = {};
+	if (fs.existsSync(`${filePath}.json`)) {
+		data = JSON.parse(
+			fs.readFileSync(`${filePath}.json`, "utf-8")
+		) as SavedFile;
+	}
+	data[page] = text;
+	fs.writeFileSync(`${filePath}.json`, JSON.stringify(data, null, 2));
+
+	let completeText = "";
+	for (const page of Object.values(data)) {
+		completeText += page + "\n";
+	}
+	fs.writeFileSync(`${filePath}.md`, completeText);
+}
+
+async function analyze(pageNumber = PAGE_NUMBER, name = FILE_NAME) {
 	const content = await getPageContent(name, pageNumber);
+
+	let text = "";
 
 	if (content.paragraphs) {
 		let paragraphs = content.paragraphs;
@@ -65,8 +85,6 @@ async function main() {
 			paragraphs = filterOutTables(paragraphs, content.tables);
 		}
 		const page = parsePage(paragraphs, pageNumber);
-
-		let text = "";
 
 		const cleanTitle = (title: string) =>
 			title.replaceAll("İ", "I").replaceAll("V", "U");
@@ -85,9 +103,11 @@ async function main() {
 			text = cleanText(text);
 		}
 
-		text = `Seite ${page}:\n\n${text}`;
-		console.log(text);
+		// text = `Seite ${page}:\n\n${text}`;
+		// console.log(text);
 	}
+
+	saveResult(name, pageNumber, text);
 }
 
 function filterOutTables(
@@ -117,7 +137,6 @@ function filterOutTables(
 					pYMin == cYMin &&
 					pYMax == cYMax
 				) {
-					console.log("Same!");
 					shouldAdd = false;
 				}
 			}
@@ -390,6 +409,13 @@ function parsePage(
 	}
 
 	return parsedPage;
+}
+
+async function main() {
+	for (let i = 3; i <= 304; i++) {
+		console.log(`Page ${i}`);
+		await analyze(i);
+	}
 }
 
 main().catch((error) => {

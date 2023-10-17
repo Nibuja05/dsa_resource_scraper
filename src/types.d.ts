@@ -56,3 +56,7 @@ interface SavedQuery {
 		[page: string]: PDFAnalyzeResults;
 	};
 }
+
+interface SavedFile {
+	[page: number]: string;
+}
