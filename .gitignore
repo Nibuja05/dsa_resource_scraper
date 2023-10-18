@@ -135,4 +135,5 @@ dist
 # =====================
 build/
 res/
+temp/
 results/

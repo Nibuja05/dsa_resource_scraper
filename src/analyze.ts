@@ -14,6 +14,13 @@ import { PDFDocument } from "pdf-lib";
 const FILE_NAME = "Liber Cantiones";
 const PAGE_NUMBER = 103;
 
+async function getPageCount(name: string = FILE_NAME) {
+	const filePath = `./res/${name}.pdf`;
+	const existingPdfBytes = fs.readFileSync(filePath);
+	const pdfDoc = await PDFDocument.load(existingPdfBytes);
+	return pdfDoc.getPageCount();
+}
+
 async function extractPage(
 	filePath: string,
 	pageNum: number
@@ -26,15 +33,16 @@ async function extractPage(
 	return await newPdfDoc.save();
 }
 
-async function getPageContent(name: string, page: number) {
-	const filePath = "./res/downloaded.json";
+async function getPageContent(name: string, page: number, write = true) {
+	const filePath = `./temp/${name}.json`;
 	let saved: SavedQuery = {};
 	if (fs.existsSync(filePath)) {
 		saved = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SavedQuery;
-		if (name in saved && page in saved[name]) {
-			return saved[name][page];
+		if (page in saved[name]) {
+			return saved[page];
 		}
-	} else {
+	} else if (write) {
+		fs.ensureDir(path.dirname(filePath));
 		fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
 	}
 
@@ -45,14 +53,26 @@ async function getPageContent(name: string, page: number) {
 	const input = await extractPage(`./res/${name}.pdf`, page);
 
 	const poller = await client.beginAnalyzeDocument("prebuilt-layout", input);
-	const data = await poller.pollUntilDone();
+	const data = { ...(await poller.pollUntilDone()), page };
 
-	if (!(name in saved)) {
-		saved[name] = {};
+	if (write) {
+		saved[page] = data;
+		fs.writeFileSync(filePath, JSON.stringify(saved, null, 2));
 	}
-	saved[name][page] = data;
-	fs.writeFileSync(filePath, JSON.stringify(saved, null, 2));
 	return data;
+}
+
+function saveCachedData(name: string, results: PDFAnalyzeResults[]) {
+	const filePath = `./temp/${name}.json`;
+	if (!fs.existsSync(filePath)) {
+		fs.ensureDir(path.dirname(filePath));
+		fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
+	}
+	const data: { [page: number]: PDFAnalyzeResults } = {};
+	for (const result of results) {
+		data[result.page] = result;
+	}
+	fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
 function saveResult(name: string, page: number, text: string) {
@@ -74,8 +94,34 @@ function saveResult(name: string, page: number, text: string) {
 	fs.writeFileSync(`${filePath}.md`, completeText);
 }
 
-async function analyze(pageNumber = PAGE_NUMBER, name = FILE_NAME) {
-	const content = await getPageContent(name, pageNumber);
+function saveAllResults(name: string, results: Array<AnalyzeResults>) {
+	const filePath = `./results/${name}`;
+	fs.ensureDirSync(path.dirname(`${filePath}.json`));
+	let data: SavedFile = {};
+	if (fs.existsSync(`${filePath}.json`)) {
+		data = JSON.parse(
+			fs.readFileSync(`${filePath}.json`, "utf-8")
+		) as SavedFile;
+	}
+	for (const [text, page] of results) {
+		data[page] = text;
+	}
+
+	fs.writeFileSync(`${filePath}.json`, JSON.stringify(data, null, 2));
+
+	let completeText = "";
+	for (const page of Object.values(data)) {
+		completeText += page + "\n";
+	}
+	fs.writeFileSync(`${filePath}.md`, completeText);
+}
+
+async function analyze(
+	pageNumber = PAGE_NUMBER,
+	name = FILE_NAME,
+	data?: PDFAnalyzeResults
+) {
+	const content = data ?? (await getPageContent(name, pageNumber));
 
 	let text = "";
 
@@ -102,12 +148,9 @@ async function analyze(pageNumber = PAGE_NUMBER, name = FILE_NAME) {
 			}
 			text = cleanText(text);
 		}
-
-		// text = `Seite ${page}:\n\n${text}`;
-		// console.log(text);
 	}
 
-	saveResult(name, pageNumber, text);
+	return <const>[text, pageNumber];
 }
 
 function filterOutTables(
@@ -412,10 +455,29 @@ function parsePage(
 }
 
 async function main() {
-	for (let i = 3; i <= 304; i++) {
+	const name = FILE_NAME;
+
+	const pageCount = await getPageCount(name);
+	const startPage = 3;
+
+	const dataPromises: Promise<PDFAnalyzeResults>[] = [];
+	for (let i = startPage; i <= Math.min(10, pageCount); i++) {
 		console.log(`Page ${i}`);
-		await analyze(i);
+		dataPromises.push(getPageContent(name, i, false));
 	}
+	const results = await Promise.all(dataPromises);
+
+	console.log("Done! saving...");
+
+	saveCachedData(name, results);
+
+	const analyzePromises: Promise<AnalyzeResults>[] = [];
+	for (const result of results) {
+		analyzePromises.push(analyze(result.page, name, result));
+	}
+
+	const analyzeResults = await Promise.all(analyzePromises);
+	saveAllResults(name, analyzeResults);
 }
 
 main().catch((error) => {

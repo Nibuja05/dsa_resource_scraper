@@ -49,12 +49,12 @@ interface DocumentSection {
 
 type PDFAnalyzeResults = import("@azure/ai-form-recognizer").AnalyzeResult<
 	import("@azure/ai-form-recognizer").AnalyzedDocument
->;
+> & { page: number };
+
+type AnalyzeResults = readonly [string, number];
 
 interface SavedQuery {
-	[name: string]: {
-		[page: string]: PDFAnalyzeResults;
-	};
+	[page: string]: PDFAnalyzeResults;
 }
 
 interface SavedFile {
