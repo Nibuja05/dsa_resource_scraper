@@ -60,3 +60,5 @@ interface SavedQuery {
 interface SavedFile {
 	[page: number]: string;
 }
+
+type AsyncFunction<T, A extends any[]> = (number, ...args: A) => Promise<T>;

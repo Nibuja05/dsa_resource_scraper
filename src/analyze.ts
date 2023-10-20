@@ -10,6 +10,7 @@ dotenv.config();
 import fs from "fs-extra";
 import * as path from "path";
 import { PDFDocument } from "pdf-lib";
+import { Semaphore } from "./semaphore";
 
 const FILE_NAME = "Liber Cantiones";
 const PAGE_NUMBER = 103;
@@ -33,18 +34,21 @@ async function extractPage(
 	return await newPdfDoc.save();
 }
 
-async function getPageContent(name: string, page: number, write = true) {
+async function getPageContent(page: number, name: string, write = true) {
 	const filePath = `./temp/${name}.json`;
 	let saved: SavedQuery = {};
 	if (fs.existsSync(filePath)) {
 		saved = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SavedQuery;
-		if (page in saved[name]) {
+		if (page in saved) {
+			console.log(`Skipping Page ${page}`);
 			return saved[page];
 		}
 	} else if (write) {
 		fs.ensureDir(path.dirname(filePath));
 		fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
 	}
+
+	console.log(`Getting Page ${page}`);
 
 	const client = new DocumentAnalysisClient(
 		process.env.AZURE_ENDPOINT!,
@@ -64,11 +68,14 @@ async function getPageContent(name: string, page: number, write = true) {
 
 function saveCachedData(name: string, results: PDFAnalyzeResults[]) {
 	const filePath = `./temp/${name}.json`;
+	let data: SavedQuery = {};
 	if (!fs.existsSync(filePath)) {
 		fs.ensureDir(path.dirname(filePath));
 		fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
+	} else {
+		data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SavedQuery;
 	}
-	const data: { [page: number]: PDFAnalyzeResults } = {};
+
 	for (const result of results) {
 		data[result.page] = result;
 	}
@@ -121,7 +128,7 @@ async function analyze(
 	name = FILE_NAME,
 	data?: PDFAnalyzeResults
 ) {
-	const content = data ?? (await getPageContent(name, pageNumber));
+	const content = data ?? (await getPageContent(pageNumber, name));
 
 	let text = "";
 
@@ -454,30 +461,75 @@ function parsePage(
 	return parsedPage;
 }
 
+async function handleMultipleCalls<T, A extends any[]>(
+	start: number,
+	end: number,
+	asyncFunction: AsyncFunction<T, A>,
+	concurrencyLimit: number,
+	...args: A
+): Promise<T[]> {
+	const results: T[] = [];
+	let errorOccurred = false;
+
+	const promises: Promise<void>[] = [];
+	const semaphore = new Semaphore(concurrencyLimit);
+
+	for (let i = start; i < end; i++) {
+		promises.push(
+			(async (index) => {
+				await semaphore.acquire();
+
+				try {
+					if (!errorOccurred) {
+						const result = await asyncFunction(index, ...args);
+						results.push(result);
+					}
+				} catch (error) {
+					errorOccurred = true;
+					// Handle the error here if needed
+					console.error("Error:", error);
+				} finally {
+					semaphore.release();
+				}
+			})(i)
+		);
+	}
+
+	await Promise.all(promises);
+
+	return results;
+}
+
 async function main() {
 	const name = FILE_NAME;
 
 	const pageCount = await getPageCount(name);
 	const startPage = 3;
 
-	const dataPromises: Promise<PDFAnalyzeResults>[] = [];
-	for (let i = startPage; i <= Math.min(10, pageCount); i++) {
-		console.log(`Page ${i}`);
-		dataPromises.push(getPageContent(name, i, false));
-	}
-	const results = await Promise.all(dataPromises);
+	console.log("Collecting...");
+	const results = await handleMultipleCalls(
+		startPage,
+		Math.min(100, pageCount),
+		getPageContent,
+		1,
+		name,
+		false
+	);
 
-	console.log("Done! saving...");
-
+	console.log("Done! Saving results...");
 	saveCachedData(name, results);
 
+	console.log("Analyzing...");
 	const analyzePromises: Promise<AnalyzeResults>[] = [];
 	for (const result of results) {
 		analyzePromises.push(analyze(result.page, name, result));
 	}
-
 	const analyzeResults = await Promise.all(analyzePromises);
+
+	console.log("Done! Saving file...");
 	saveAllResults(name, analyzeResults);
+
+	console.log(`\nSuccessfully completed analyzing "${name}"`);
 }
 
 main().catch((error) => {
