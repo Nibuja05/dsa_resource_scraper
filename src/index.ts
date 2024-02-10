@@ -1,266 +1,91 @@
-import axios from "axios";
-import { JSDOM } from "jsdom";
-import xpath from "xpath";
-import fs from "fs-extra";
 import readline from "readline";
-import os from "os";
-import path from "path";
+import OpenAI from "openai";
 
-function emptySources() {
-	return {
-		main: [],
-		additions: [],
-		references: [],
-	};
-}
+import * as dotenv from "dotenv";
+import { searchWeb } from "./search";
+import { getAnalyzed } from "./analyze";
+import { estimateTokenCount, splitStringWithSeparator } from "./util";
+import { createSearchIndex, search } from "./docSearch";
+dotenv.config();
 
-function getSearchUrl(text: string) {
-	const transformedText = text.replaceAll(" ", "+");
-	return `https://de.wiki-aventurica.de/de/index.php?search=${transformedText}&title=Spezial%3ASuche&profile=default&fulltext=1`;
-}
+const openai = new OpenAI({
+	apiKey: process.env.OPENAI_KEY, // This is the default and can be omitted
+});
+const keyWordInstruction = `User
+Follow my instructions precisely to create a highly effective Query Logic Composition from the following input query. Do not explain or elaborate. Identify the most relevant key components of the input query (ignore stop words, etc). Please return only the base of the word (no conjugation/plural etc,) and substantize and adjust it as needed. Return them in a quoted list, as following:
+["ItemA", "ItemB", ...]
 
-function getFullUrl(url: string) {
-	return `https://de.wiki-aventurica.de${url}`;
-}
+Example: Wie lange kann man unterwasser atmen? -> ["Atmen", "Unterwasser"]
+Example: Wie viel kostet eine Zwiebel? -> ["Kosten", "Zwiebel"]`;
+const finalInstruction = `You are an expert for the Roleplaying Game DSA (Das Schwarze Auge). Your task is to answer a given query as precisely as possible. Use the given sources as input and only answer with statements that can be proven by the input. Cite the source like this: ...Text... [Quelle: <Quelle>].`;
 
-async function searchWeb(phrase: string, ruleSystem: string) {
-	console.log(`Beginne Suche nach "${phrase}"`);
-	const url = getSearchUrl(phrase);
+async function askGPT(
+	instruction: string,
+	phrase: string,
+	additionalInput?: string[],
+	asList?: false
+): Promise<string>;
+async function askGPT(
+	instruction: string,
+	phrase: string,
+	additionalInput?: string[],
+	asList?: true
+): Promise<Array<string>>;
+async function askGPT(
+	instruction: string,
+	phrase: string,
+	additionalInput?: string[],
+	asList?: boolean
+): Promise<string | Array<string>> {
+	const systemMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+		(additionalInput ?? []).map((doc) => ({
+			role: "system",
+			content: doc,
+		}));
 
-	const response = await axios.get(url);
-	const dom = new JSDOM(response.data);
-	const document = dom.window.document;
-
-	const searchResults = document.querySelectorAll(
-		".searchresults > .mw-search-results:first-of-type .mw-search-result a"
+	const chatCompletion = await openai.chat.completions.create({
+		messages: [
+			...systemMessages,
+			{ role: "user", content: `${instruction}\n\nInput: ${phrase}` },
+		],
+		// model: "gpt-3.5-turbo",
+		model: "gpt-4",
+	});
+	const choices = chatCompletion.choices.map(
+		(choice) => choice.message.content
 	);
-	const uniqueLinks = new Set<string>();
-
-	searchResults.forEach((element) => {
-		const link = element.getAttribute("href");
-		if (link) {
-			uniqueLinks.add(link);
-		}
-	});
-
-	const sourcesList: Sources[] = [];
-	let totalFiltered = 0;
-
-	console.log(`Durchsuche Ergebnisse (${uniqueLinks.size} insgesamt):`);
-	let index = 1;
-
-	for (const link of uniqueLinks) {
-		process.stdout.write(`-> Ergebnis ${index} von ${uniqueLinks.size}\r`);
-		index++;
-
-		const rawSources = await findRawSources(getFullUrl(link));
-		const [sources, filteredOut] = await filterRawSources(
-			rawSources,
-			ruleSystem
-		);
-		sourcesList.push(sources);
-		totalFiltered += filteredOut;
-	}
-	console.log("\r\n");
-
-	return <const>[combineSources(sourcesList), totalFiltered];
+	const bestChoice = choices[0]!;
+	if (asList) return eval(bestChoice) as Array<string>;
+	return bestChoice;
 }
 
-async function findRawSources(url: string): Promise<RawSources> {
-	const select = xpath.useNamespaces({
-		html: "http://www.w3.org/1999/xhtml",
-	});
-
-	function getLinksFromSection(
-		document: Document,
-		name: string
-	): RawSource[] {
-		const ulNodes = select(
-			`//html:h3[html:span[@class='mw-headline' and text()='${name}']]/following-sibling::html:ul[1]`,
-			document
-		) as Node[];
-
-		if (ulNodes && ulNodes.length > 0) {
-			const ulElement = ulNodes[0] as Element;
-			const liNodes = ulElement.querySelectorAll("li");
-
-			const results = Array.from(liNodes).map((li) => {
-				const aElement = li.querySelector("a");
-				const textContent = li.textContent?.trim() ?? "";
-				const match = textContent.match(/Seite(n)? ([\d-]+)/);
-				const pageNumber = match ? match[2] : "";
-
-				return {
-					link: aElement
-						? getFullUrl(aElement.getAttribute("href")!)
-						: "",
-					name: aElement ? aElement.textContent?.trim()! : "",
-					pages: pageNumber,
-				};
-			});
-			return results;
-		}
-		return [];
-	}
-
-	const response = await axios.get(url);
-	const dom = new JSDOM(response.data);
-	const document = dom.window.document;
-
-	const sources = {
-		main: getLinksFromSection(document, "Ausführliche Quellen"),
-		additions: getLinksFromSection(document, "Ergänzende Quellen"),
-		references: getLinksFromSection(document, "Erwähnungen"),
-	};
-	return sources;
-}
-
-async function filterRawSources(sources: RawSources, ruleSystem: string) {
-	const cleanedSources: Sources = emptySources();
-	let filterNum = 0;
-	for (const sourceType of <const>["main", "additions", "references"]) {
-		for (const source of sources[sourceType]) {
-			const ruling = await checkAndUpdateSourceRules(source);
-			if (ruling == ruleSystem) {
-				let pages: number[] = [];
-				if (source.pages.includes("-")) {
-					const match = source.pages.match(/(\d+)\-(\d+)/);
-					if (match) {
-						for (
-							let i = parseInt(match[1]);
-							i <= parseInt(match[2]);
-							i++
-						) {
-							pages.push(i);
-						}
-					}
-				} else pages.push(parseInt(source.pages));
-				cleanedSources[sourceType].push({
-					name: source.name,
-					pages,
-				});
-			} else filterNum++;
-		}
-	}
-	return <const>[cleanedSources, filterNum];
-}
-
-async function checkAndUpdateSourceRules(
-	source: RawSource
-): Promise<string | null> {
-	const userHome = os.homedir();
-	const filePath = path.join(
-		userHome,
-		"Documents",
-		"DSASuche",
-		"source_rules.json"
-	);
-
-	// Ensure directory exists
-	await fs.ensureDir(path.dirname(filePath));
-
-	let data = await fs.readJson(filePath).catch(() => ({}));
-
-	if (data[source.name]) return data[source.name];
-
-	const result = await getSourceRuling(source.link);
-	data[source.name] = result;
-	await fs.writeJson(filePath, data, { spaces: 2 }).catch(console.error);
-
-	return result;
-}
-
-async function getSourceRuling(url: string): Promise<string> {
-	const response = await axios.get(url);
-	const dom = new JSDOM(response.data);
-	const document = dom.window.document;
-	const select = xpath.useNamespaces({
-		html: "http://www.w3.org/1999/xhtml",
-	});
-	const nodes = select(
-		"//html:table[contains(@class,'infobox')]/html:tbody/html:tr/html:td[html:a[@title='Regelsystem']]/following-sibling::html:td[1]",
-		document
-	) as Node[];
-	return nodes.length ? nodes[0].textContent?.trim() || "" : "";
-}
-
-function combineSources(sources: Sources[]) {
-	const totalSources: Sources = emptySources();
-	const mainNames: Set<string> = new Set();
-	const additionsNames: Set<string> = new Set();
-	const referencesNames: Set<string> = new Set();
-
-	function combineIn(
-		sourceName: SourcesKey,
-		set: Set<string>,
-		sourceList: Source[]
-	) {
-		for (const { name, pages } of sourceList) {
-			if (set.has(name)) {
-				totalSources[sourceName] = totalSources[sourceName].map(
-					(source) => {
-						if (source.name != name) return source;
-						return {
-							name,
-							pages: Array.from(
-								new Set([...source.pages, ...pages])
-							),
-						};
-					}
-				);
-			} else {
-				set.add(name);
-				totalSources[sourceName].push({
-					name,
-					pages,
-				});
+function createDocuments(
+	pages: AnalyzeResults[],
+	name?: string
+): DSADocument[] {
+	let docs: DSADocument[] = [];
+	let id = 0;
+	for (const [content, page] of pages) {
+		const parts = splitStringWithSeparator(content, "##");
+		for (const part of parts) {
+			const match = part.match(/##\s*(.*?)\n\s*(.*)/s);
+			if (!match) {
+				console.log("COULD NOT MATCH");
+				continue;
 			}
+			const doc: DSADocument = {
+				id,
+				title: match[1] ?? "",
+				content: match[2] ?? "",
+				source: name,
+				sourcePage: page,
+				orig: part,
+			};
+			id++;
+			docs.push(doc);
 		}
 	}
-
-	for (const { main, additions, references } of sources) {
-		combineIn("main", mainNames, main);
-		combineIn("additions", additionsNames, additions);
-		combineIn("references", referencesNames, references);
-	}
-	return totalSources;
-}
-
-async function nicePrint(phrase: string, ruleSystem: string) {
-	const [results, filtered] = await searchWeb(phrase, ruleSystem);
-	let text = `===========================================================\n`;
-	text += `Ergebnisse für Suche nach "${phrase}:\n\n`;
-
-	function prettySources(sources: Source[]) {
-		for (const source of sources) {
-			text += ` - ${source.name} (Seite${
-				source.pages.length > 1 ? "n" : ""
-			}: ${prettyPages(source.pages)})\n`;
-		}
-		text += "\n";
-	}
-	function prettyPages(pages: number[]) {
-		return pages
-			.map((page) => `${page}`)
-			.reduce((prev, cur) => `${prev}, ${cur}`);
-	}
-
-	if (results.main.length > 0) {
-		text += `Ausführliche Quellen:\n`;
-		prettySources(results.main);
-	}
-	if (results.additions.length > 0) {
-		text += `Ergänzungen:\n`;
-		prettySources(results.additions);
-	}
-	if (results.references.length > 0) {
-		text += `Erwähnungen:\n`;
-		prettySources(results.references);
-	}
-
-	text += `===========================================================\n`;
-	text += `Insgesammt ${filtered} Quellen ignoriert, die nicht dem Regelwerk ${ruleSystem} entsprachen\n`;
-	console.log(text);
+	return docs;
 }
 
 const rl = readline.createInterface({
@@ -268,23 +93,65 @@ const rl = readline.createInterface({
 	output: process.stdout,
 });
 
-function getUserInput(): Promise<string> {
+function getUserInput(question = "Was möchtest du wissen?"): Promise<string> {
 	return new Promise((resolve) => {
-		rl.question("Wonach suchst du? ", (input) => {
+		rl.question(`${question} `, (input) => {
 			resolve(input);
 		});
 	});
 }
 
 async function main() {
-	const ruleSystem = process.argv[2] ?? "DSA4.1";
+	const phrase = await getUserInput();
+	rl.close();
+	console.log("\n");
+	const answer = await askGPT(keyWordInstruction, phrase, undefined, true);
 
-	while (true) {
-		const phrase = await getUserInput();
-		console.log("\n");
-		await nicePrint(phrase, ruleSystem);
-		console.log("\n");
+	console.log(answer);
+	return;
+	// const phrase = "Was ist Endurium?";
+	// const answer = ["Endurium"];
+
+	console.log("Suche...");
+
+	// let analyzedPages: AnalyzeResults[] = [];
+	let documents: DSADocument[] = [];
+
+	for (const keyword of answer) {
+		console.log(`-> nach ${keyword}`);
+		const [results, filtered] = await searchWeb(keyword, "DSA4.1");
+
+		for (const { name, pages } of results.main) {
+			const analyzeResult = await getAnalyzed(name, pages).catch((err) =>
+				console.log("An error occured: ", err)
+			);
+			if (analyzeResult)
+				documents = [
+					...documents,
+					...createDocuments(analyzeResult, name),
+				];
+			// analyzedPages = [...analyzedPages, ...analyzeResult];
+		}
 	}
+
+	const docIndex = createSearchIndex(documents);
+	const result = search(phrase, docIndex);
+
+	const docInputs: string[] = [];
+
+	for (let i = 0; i < 5; i++) {
+		const bestResult = result[i].ref;
+		const bestDoc = documents[parseInt(bestResult)];
+		const newInput = `${bestDoc.source}: ${bestDoc.sourcePage}\n${bestDoc.orig}`;
+		docInputs.push(newInput);
+	}
+
+	console.log(docInputs);
+	return;
+
+	const finalAnswer = await askGPT(finalInstruction, phrase, docInputs);
+
+	console.log(finalAnswer);
 }
 main().catch((err) => {
 	console.error(err);

@@ -12,7 +12,10 @@ import * as path from "path";
 import { PDFDocument } from "pdf-lib";
 import { Semaphore } from "./semaphore";
 
-const FILE_NAME = "Liber Cantiones";
+import { glob } from "glob";
+import { stringSimilarityOfList } from "./util";
+
+const FILE_NAME = "Wege der Goetter";
 const PAGE_NUMBER = 103;
 
 async function getPageCount(name: string = FILE_NAME) {
@@ -34,7 +37,13 @@ async function extractPage(
 	return await newPdfDoc.save();
 }
 
-async function getPageContent(page: number, name: string, write = true) {
+async function getPageContent(
+	page: number,
+	name: string,
+	rulePath?: string,
+	write = true
+) {
+	console.log("Getting content!", page);
 	const filePath = `./temp/${name}.json`;
 	let saved: SavedQuery = {};
 	if (fs.existsSync(filePath)) {
@@ -54,7 +63,7 @@ async function getPageContent(page: number, name: string, write = true) {
 		process.env.AZURE_ENDPOINT!,
 		new AzureKeyCredential(process.env.AZURE_KEY!)
 	);
-	const input = await extractPage(`./res/${name}.pdf`, page);
+	const input = await extractPage(rulePath ?? `./res/${name}.pdf`, page);
 
 	const poller = await client.beginAnalyzeDocument("prebuilt-layout", input);
 	const data = { ...(await poller.pollUntilDone()), page };
@@ -80,6 +89,30 @@ function saveCachedData(name: string, results: PDFAnalyzeResults[]) {
 		data[result.page] = result;
 	}
 	fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function getCachedPages(name: string) {
+	const pages: number[] = [];
+	const filePath = `./results/${name}.json`;
+	if (fs.existsSync(filePath)) {
+		const data = JSON.parse(
+			fs.readFileSync(filePath, "utf-8")
+		) as SavedPages;
+		for (const page of Object.keys(data)) {
+			pages.push(parseInt(page));
+		}
+	}
+	return pages;
+}
+
+function getCachedPage(name: string, page: number) {
+	const filePath = `./results/${name}.json`;
+	if (fs.existsSync(filePath)) {
+		const data = JSON.parse(
+			fs.readFileSync(filePath, "utf-8")
+		) as SavedPages;
+		return data[page];
+	}
 }
 
 function saveResult(name: string, page: number, text: string) {
@@ -127,7 +160,7 @@ async function analyze(
 	pageNumber = PAGE_NUMBER,
 	name = FILE_NAME,
 	data?: PDFAnalyzeResults
-) {
+): Promise<AnalyzeResults> {
 	const content = data ?? (await getPageContent(pageNumber, name));
 
 	let text = "";
@@ -500,19 +533,69 @@ async function handleMultipleCalls<T, A extends any[]>(
 	return results;
 }
 
+async function getMatchingRulebook(name: string) {
+	const allFiles = await glob("res/**/*.pdf");
+	const fileNames = allFiles.map((filePath) => path.parse(filePath).name);
+	const similarities = stringSimilarityOfList(name, fileNames);
+	const maxSim = Math.max(...similarities);
+
+	// Maybe adjust threshold??
+	if (maxSim <= 0.8) return;
+
+	const maxSimIndex = similarities.indexOf(maxSim);
+	return allFiles[maxSimIndex];
+}
+
+export async function getAnalyzed(name: string, pages: number[]) {
+	const filePath = await getMatchingRulebook(name);
+	if (!filePath) throw `Could not find source rulebook for "${name}"`;
+
+	const cachedPages = getCachedPages(name);
+
+	let analyzedPages: AnalyzeResults[] = [];
+	for (const pageIndex of pages) {
+		const mappedIndex = pageIndex + 0; // front
+		if (cachedPages.includes(mappedIndex)) {
+			const cached = getCachedPage(name, mappedIndex);
+			if (cached) {
+				analyzedPages.push([cached, mappedIndex]);
+				continue;
+			}
+		}
+		const pageContent = await getPageContent(
+			mappedIndex,
+			name,
+			filePath,
+			true
+		);
+		console.log("analyze?");
+		const result = await analyze(mappedIndex, name, pageContent);
+		analyzedPages.push(result);
+	}
+	saveAllResults(name, analyzedPages);
+
+	return analyzedPages;
+}
+
 async function main() {
 	const name = FILE_NAME;
 
 	const pageCount = await getPageCount(name);
-	const startPage = 3;
+	const cachedPages = getCachedPages(name);
+
+	const startPage = 4;
+	const lastPage =
+		cachedPages.length > 0 ? cachedPages[cachedPages.length - 1] : 0;
+	const maxPage = startPage + lastPage + 100;
 
 	console.log("Collecting...");
 	const results = await handleMultipleCalls(
-		startPage,
-		Math.min(100, pageCount),
+		lastPage || startPage,
+		Math.min(maxPage, pageCount),
 		getPageContent,
-		1,
+		5,
 		name,
+		undefined,
 		false
 	);
 
@@ -532,7 +615,10 @@ async function main() {
 	console.log(`\nSuccessfully completed analyzing "${name}"`);
 }
 
-main().catch((error) => {
-	console.error("An error occurred:", error);
-	process.exit(1);
-});
+// run if executed directly
+if (require.main === module) {
+	main().catch((error) => {
+		console.error("An error occurred:", error);
+		process.exit(1);
+	});
+}

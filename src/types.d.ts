@@ -57,8 +57,26 @@ interface SavedQuery {
 	[page: string]: PDFAnalyzeResults;
 }
 
+interface SavedPages {
+	[page: string]: string;
+}
+
 interface SavedFile {
 	[page: number]: string;
 }
 
 type AsyncFunction<T, A extends any[]> = (number, ...args: A) => Promise<T>;
+
+interface DefaultCache {
+	[key: string]: string;
+}
+
+interface DSADocument {
+	id: number;
+	title: string;
+	source?: string;
+	sourcePage?: number;
+	content: string;
+	metaData?: any;
+	orig: string;
+}
