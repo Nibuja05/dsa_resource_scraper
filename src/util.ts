@@ -3,7 +3,55 @@ import os from "os";
 import path from "path";
 import { stringSimilarity } from "string-similarity-js";
 
-export function stringSimilarityOfList(str: string, list: string[]) {
+export function checkStringInclude(str: string, list: string[]) {
+	str = str.toLowerCase();
+	function preReturnFilter(resultList: string[]) {
+		return resultList
+			.filter((result) => !result.toLowerCase().includes("errata"))
+			.map((result) => list.indexOf(result));
+	}
+
+	let results = [];
+	for (const item of list) {
+		if (
+			item.toLowerCase().includes(str) ||
+			str.includes(item.toLowerCase())
+		)
+			results.push(item);
+	}
+	if (results.length > 0) {
+		return preReturnFilter(results);
+	}
+
+	const parts = str.split(/\s+/);
+	let maxParts = 0;
+	for (const item of list) {
+		const count = parts.filter((part) =>
+			item.toLowerCase().includes(part)
+		).length;
+		if (count >= maxParts) {
+			if (count > maxParts) results = [];
+			maxParts = count;
+			results.push(item);
+		}
+	}
+
+	console.log(
+		`Best finds with ${maxParts}/${parts.length} matching parts:`,
+		results
+	);
+	return preReturnFilter(results);
+}
+
+export function stringSimilarityOfList(
+	str: string,
+	list: string[],
+	indexList?: number[]
+) {
+	if (indexList) {
+		list = indexList.map((i) => list[i]);
+	}
+	console.log("search for:", list);
 	return list.map((item) => stringSimilarity(str, item));
 }
 

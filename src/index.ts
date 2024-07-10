@@ -1,11 +1,14 @@
 import readline from "readline";
 import OpenAI from "openai";
 
+import fs from "fs-extra";
+
 import * as dotenv from "dotenv";
 import { searchWeb } from "./search";
 import { getAnalyzed } from "./analyze";
 import { estimateTokenCount, splitStringWithSeparator } from "./util";
-import { createSearchIndex, search } from "./docSearch";
+import { createSearchIndex, search, vectorSearch } from "./docSearch";
+import openaiTokenCounter from "openai-gpt-token-counter";
 dotenv.config();
 
 const openai = new OpenAI({
@@ -14,10 +17,13 @@ const openai = new OpenAI({
 const keyWordInstruction = `User
 Follow my instructions precisely to create a highly effective Query Logic Composition from the following input query. Do not explain or elaborate. Identify the most relevant key components of the input query (ignore stop words, etc). Please return only the base of the word (no conjugation/plural etc,) and substantize and adjust it as needed. Return them in a quoted list, as following:
 ["ItemA", "ItemB", ...]
+Don't split compound words, Example: "Was ist ein Riesenkäfer?" -> ["Riesenkäfer"]
+Only use the most relevant words, where specific knowledge is required, Example: "Welche Sorten Wein sind bekannt?" -> ["Wein"] // don't include Sorte or bekannt, as this is common knowledge
 
-Example: Wie lange kann man unterwasser atmen? -> ["Atmen", "Unterwasser"]
-Example: Wie viel kostet eine Zwiebel? -> ["Kosten", "Zwiebel"]`;
+Example: "Wie lange kann man unterwasser atmen?" -> ["Atmen", "Unterwasser"]
+Example: "Wie viel kostet eine Zwiebel?" -> ["Kosten", "Zwiebel"]`;
 const finalInstruction = `You are an expert for the Roleplaying Game DSA (Das Schwarze Auge). Your task is to answer a given query as precisely as possible. Use the given sources as input and only answer with statements that can be proven by the input. Cite the source like this: ...Text... [Quelle: <Quelle>].`;
+const OPENAI_MODEL = "gpt-3.5-turbo";
 
 async function askGPT(
 	instruction: string,
@@ -48,8 +54,8 @@ async function askGPT(
 			...systemMessages,
 			{ role: "user", content: `${instruction}\n\nInput: ${phrase}` },
 		],
-		// model: "gpt-3.5-turbo",
-		model: "gpt-4",
+		model: OPENAI_MODEL,
+		// model: "gpt-4",
 	});
 	const choices = chatCompletion.choices.map(
 		(choice) => choice.message.content
@@ -69,18 +75,18 @@ function createDocuments(
 		const parts = splitStringWithSeparator(content, "##");
 		for (const part of parts) {
 			const match = part.match(/##\s*(.*?)\n\s*(.*)/s);
-			if (!match) {
-				console.log("COULD NOT MATCH");
-				continue;
-			}
 			const doc: DSADocument = {
 				id,
-				title: match[1] ?? "",
-				content: match[2] ?? "",
+				title: "",
+				content: part,
 				source: name,
 				sourcePage: page,
 				orig: part,
 			};
+			if (match) {
+				doc.title = match[1] ?? "";
+				doc.content = match[2] ?? "";
+			}
 			id++;
 			docs.push(doc);
 		}
@@ -108,7 +114,6 @@ async function main() {
 	const answer = await askGPT(keyWordInstruction, phrase, undefined, true);
 
 	console.log(answer);
-	return;
 	// const phrase = "Was ist Endurium?";
 	// const answer = ["Endurium"];
 
@@ -122,6 +127,7 @@ async function main() {
 		const [results, filtered] = await searchWeb(keyword, "DSA4.1");
 
 		for (const { name, pages } of results.main) {
+			console.log(`\nAnaylyze: "${name}" (${pages})`);
 			const analyzeResult = await getAnalyzed(name, pages).catch((err) =>
 				console.log("An error occured: ", err)
 			);
@@ -134,21 +140,62 @@ async function main() {
 		}
 	}
 
-	const docIndex = createSearchIndex(documents);
-	const result = search(phrase, docIndex);
+	// const docIndex = createSearchIndex(documents);
+	// const result = search(phrase, docIndex);
+
+	console.log("\nSearching in results for query answers...\n");
+	let vectorResults = await vectorSearch(phrase, documents);
 
 	const docInputs: string[] = [];
 
-	for (let i = 0; i < 5; i++) {
-		const bestResult = result[i].ref;
-		const bestDoc = documents[parseInt(bestResult)];
-		const newInput = `${bestDoc.source}: ${bestDoc.sourcePage}\n${bestDoc.orig}`;
+	// calculate tokens
+	const maxTokens = 8192;
+	let curTokens = 0;
+
+	for (let i = 0; i < 10; i++) {
+		const result = vectorResults[i];
+		if (!result) continue;
+
+		const newInput = `${result.document.source}: ${result.document.sourcePage}\n${result.document.content}`;
+
+		const tokenCount = estimateTokenCount(newInput);
+		if (curTokens + tokenCount >= maxTokens) break; // dont use too many ressources!
+		curTokens += tokenCount;
 		docInputs.push(newInput);
 	}
 
-	console.log(docInputs);
-	return;
+	// for (let i = 0; i < 10; i++) {
+	// 	if (!result[i]) continue;
+	// 	const bestResult = result[i].ref;
+	// 	const bestDoc = documents[parseInt(bestResult)];
+	// 	const newInput = `${bestDoc.source}: ${bestDoc.sourcePage}\n${bestDoc.orig}`;
 
+	// 	const tokenCount = estimateTokenCount(newInput);
+	// 	if (curTokens + tokenCount >= maxTokens) break; // dont use too many ressources!
+	// 	curTokens += tokenCount;
+	// 	docInputs.push(newInput);
+	// }
+
+	// let docs = [];
+	// for (const doc of documents) {
+	// 	docs.push(`${doc.source} - ${doc.sourcePage}: ${doc.orig}`);
+	// }
+
+	fs.writeFileSync(
+		"./out_docs_test.json",
+		JSON.stringify(docInputs, null, 2)
+	);
+
+	// fs.writeFileSync("./out_docs_all_test.json", JSON.stringify(docs, null, 2));
+
+	if (docInputs.length == 0) {
+		console.log(
+			"\n\nThere was no input document found! No sources means no answer :/"
+		);
+		return;
+	}
+
+	console.log("\nAsking AI for final answer...\n");
 	const finalAnswer = await askGPT(finalInstruction, phrase, docInputs);
 
 	console.log(finalAnswer);

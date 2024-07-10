@@ -13,7 +13,7 @@ import { PDFDocument } from "pdf-lib";
 import { Semaphore } from "./semaphore";
 
 import { glob } from "glob";
-import { stringSimilarityOfList } from "./util";
+import { checkStringInclude, stringSimilarityOfList } from "./util";
 
 const FILE_NAME = "Wege der Goetter";
 const PAGE_NUMBER = 103;
@@ -536,11 +536,13 @@ async function handleMultipleCalls<T, A extends any[]>(
 async function getMatchingRulebook(name: string) {
 	const allFiles = await glob("res/**/*.pdf");
 	const fileNames = allFiles.map((filePath) => path.parse(filePath).name);
-	const similarities = stringSimilarityOfList(name, fileNames);
+	const includes = checkStringInclude(name, fileNames);
+	if (includes.length == 1) return allFiles[includes[0]];
+	const similarities = stringSimilarityOfList(name, fileNames, includes);
 	const maxSim = Math.max(...similarities);
 
 	// Maybe adjust threshold??
-	if (maxSim <= 0.8) return;
+	if (includes.length == 0 && maxSim <= 0.8) return;
 
 	const maxSimIndex = similarities.indexOf(maxSim);
 	return allFiles[maxSimIndex];
@@ -548,6 +550,7 @@ async function getMatchingRulebook(name: string) {
 
 export async function getAnalyzed(name: string, pages: number[]) {
 	const filePath = await getMatchingRulebook(name);
+	console.log(`Search for file: ${name}\nFound: ${filePath}\n`);
 	if (!filePath) throw `Could not find source rulebook for "${name}"`;
 
 	const cachedPages = getCachedPages(name);
